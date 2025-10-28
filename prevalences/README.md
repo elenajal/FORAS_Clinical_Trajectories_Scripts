@@ -9,7 +9,6 @@ R Markdown workflow to compute and visualise pooled **prevalence** estimates for
 - Produces forest and funnel-type plots
 - Writes summaries/plots to `prevalences/output/`
 
-
 ## Requirements
 
 - R (≥ 4.2)
@@ -21,11 +20,8 @@ Install essentials:
 install.packages(c("rmarkdown", "tidyverse", "metafor", "meta"))
 ```
 
----
-
 ## Inputs
 - The dataset containing all extracted data (can be downloaded on DataVerseNL).
----
 
 ## How to run
 
@@ -37,6 +33,4 @@ From R:
 rmarkdown::render("prevalences/Prevalences_analysis.Rmd")
 ```
 
-Outputs (HTML by default) and figures are saved under `prevalences/` (see the Rmd for exact paths).
-
----
+Outputs (HTML by default) and figures are saved under `prevalences/`.
