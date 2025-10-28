@@ -1,4 +1,4 @@
-# Prevalence Estimates for the Meta-analysis of PTSD Symptom Trajectories
+# Prevalence Estimates for the Meta-analysis of Clinical PTSD Symptom Trajectories
 
 R Markdown workflow to compute and visualise pooled **prevalence** estimates for the FORAS project on clinical PTSD symptom trajectories after traumatic events. 
 
