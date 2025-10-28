@@ -1,6 +1,6 @@
 # Overview
 
-This repository is part of the **Hunt for the Last Relevant Paper** project.
+This repository is part of the **Hunt for the Last Relevant Paper: blending the best of humans and AI** project (full paper: https://doi.org/10.1080/20008066.2025.2546214).
 
 The current repository is focusing on the scripts used for the meta-analysis of PTSD symptom trajectories of clinical populations.
 
@@ -11,6 +11,7 @@ The current repository is focusing on the scripts used for the meta-analysis of 
 - Located in `prevalences/`
 
 - **Purpose**: R Markdown workflow to compute and visualise pooled **prevalence** estimates for the FORAS project on PTSD trajectories after traumatic events.
+
 ## `Moderator_analysis.Rmd`
 
 - Located in `moderators/`
