@@ -1,8 +1,7 @@
 # Data
 
-The analyses requires 2 datasets:
+The analyses require the dataset:
 
 - `Data_clincal_trajectories.csv` 
-- `grolts_scores.csv`
 
 which will be made available via DataVerseNL. 
