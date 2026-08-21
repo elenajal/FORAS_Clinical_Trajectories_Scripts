@@ -2,6 +2,6 @@
 
 The analyses require the dataset:
 
-- `Data_clincal_trajectories.csv` 
+- `data.xlsx` 
 
 which will be made available via DataVerseNL. 
