@@ -1,1 +1,1 @@
-This folder contains the script for the timeline visualization, showing the individual timepoints per sample. 
+This folder contains the script for the Figure 'Visualization of Timepoint Assessments in Months, Treatment Period and investigated Trauma Type per Sample'. 
