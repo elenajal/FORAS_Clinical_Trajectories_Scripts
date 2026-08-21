@@ -1,11 +1,8 @@
 ---
-title: "Generalized Linear Mixed Models for Prevalences"
-date: "2025-07-20"
+title: "Bayesian Generalized Linear Mixed Models for Trajectory Prevalences"
+date: "`r Sys.Date()`"
 encoding: UTF-8
 output:
-  word_document:
-    toc: true
-    toc_depth: '4'
   html_document:
     toc: true
     toc_float: true
@@ -13,17 +10,19 @@ output:
     toc_depth: 4
     number_sections: true
     code_folding: hide
+  word_document:
+    toc: true
+    toc_depth: '4'
   pdf_document:
     toc: true
     toc_depth: '4'
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, warning = F, message = FALSE, cache = FALSE)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE)
 
 # Set the root directory for the entire document (recommended way)
 knitr::opts_knit$set(root.dir = dirname(rstudioapi::getActiveDocumentContext()$path))
-
 ```
 
 # Preparation
@@ -31,27 +30,28 @@ knitr::opts_knit$set(root.dir = dirname(rstudioapi::getActiveDocumentContext()$p
 ```{r load-packages}
 library(readxl)
 library(readr)
-library(metafor)
-library(lme4)
-library(influence.ME)
 library(dplyr)
 library(gt)
 library(purrr)
 library(tidyr)
+library(brms)
+library(loo)
+library(posterior)
+library(bayesplot)
 ```
 
 ## Load Data
 
 ```{r load-data}
 # load data
-df_moderation <- read_excel("../extracted_data/Clinical_extraction_cleaned.xlsx")
+df_moderation <- read_excel("../extracted_data/Clinical_extraction_final.xlsx")
 
 # force all character columns to UTF-8
 df_moderation <- df_moderation |>
   dplyr::mutate(dplyr::across(where(is.character), ~ enc2utf8(.x)))
 
 # select relevant columns
-df_moderation <- df_moderation[, c("Study", "Sample_name", "MID", "Sample_size", "Mean_age", "SD", "Percentage_women", "trauma_type", "TP_assessments", "Treatment_type", "Treatment_length", "N_trajectories", "High", "High_n", "High_percentage", "Partially_Decreasing", "Partially_Decreasing_n", "Partially_Decreasing_percentage", "Decreasing", "Decreasing_n", "Decreasing_percentage", "Relapsing", "Relapsing_n", "Relapsing_percentage")] 
+df_moderation <- df_moderation[, c("Study", "Sample_name", "MID", "Sample_size", "Mean_age", "SD", "Percentage_women", "trauma_type", "TP_assessments", "Treatment_type", "Treatment_length", "N_trajectories", "Persistent", "Persistent_n", "Persistent_percentage", "Partially_Decreasing", "Partially_Decreasing_n", "Partially_Decreasing_percentage", "Decreasing", "Decreasing_n", "Decreasing_percentage", "Relapsing", "Relapsing_n", "Relapsing_percentage")] 
 
 # Display the first rows to check the data
 head(df_moderation)
@@ -69,7 +69,10 @@ total_Sample_size <- sum(df_moderation$Sample_size, na.rm = TRUE)
 # Create a summary table
 summary_table <- data.frame(
   Description = c("Number of studies / cohorts", "Total sample size (sum of available Sample_size)"),
-  Value = format(c(total_number_of_samples, total_Sample_size), big.mark = ",")
+  Value = c(
+    format(total_number_of_samples, big.mark = ",", trim = TRUE), 
+    format(total_Sample_size, big.mark = ",", trim = TRUE)
+  )
 )
 
 # Display as a table
@@ -138,826 +141,581 @@ if (knitr::is_html_output() || knitr::is_latex_output()) {
       extra_css = "font-family: 'Times New Roman', Times, serif;"
     ) |>
     kableExtra::scroll_box(height = "470px")
+} else {
+  overview
 }
-
-overview
-
 ```
 
 # Prevalences
 
-```{r portable-glmm-function}
-# Portable function for pooled prevalence via GLMM with continuity correction
-fit_glmm_prev <- function(df, event_col, n_col = "Sample_size", label = event_col) {
+## Bayesian GLMM Function
 
-  xi <- suppressWarnings(as.numeric(df[[event_col]]))
+We fit a Bayesian random-intercept GLMM using `brms`. This models the binomial data-generating process via Hamiltonian Monte Carlo (Stan). This provides fully probabilistic uncertainty intervals (credible intervals) and behaves gracefully when the number of studies is small, between-study heterogeneity is close to zero, or studies report extreme proportions.
+
+We use weakly informative priors: `normal(0, 1.5)` on the population-level logit-scale intercept and a `student_t(3, 0, 1)` prior on the between-study standard deviation. The function returns a list containing both the summary table data frame and the full `brmsfit` object (used later for Leave-One-Out Cross-Validation).
+
+```{r portable-bglmm-function}
+# Portable function for pooled prevalence via Bayesian GLMM (brms)
+fit_bglmm_prev <- function(df, event_col, n_col = "Sample_size", label = event_col,
+                           chains = 4, iter = 4000, warmup = 1000,
+                           adapt_delta = 0.95, seed = 123, refresh = 0, min_k = 3) {
+
+  xi <- suppressWarnings(round(as.numeric(df[[event_col]])))
   ni <- suppressWarnings(as.numeric(df[[n_col]]))
 
-  # Identify rows that are valid for meta-analysis
   ok <- !is.na(xi) & !is.na(ni) & ni > 0 & xi >= 0 & xi <= ni
+  k  <- length(unique(df$Study[ok]))
 
-  # If too few usable studies, skip (or swap to a fallback model)
-  k <- sum(ok)
-  if (k < 3) {
-    message(label, ": only ", k,
-            " usable studies after filtering; random-effects GLMM not estimable. Skipping.")
+  if (sum(ok) < min_k) {
+    message(label, ": only ", sum(ok),
+            " usable studies after filtering (minimum required: ", min_k,
+            "); Bayesian GLMM not estimable. Skipping.")
     return(
-      data.frame(
-        Analysis = label,
-        Pooled_Prevalence = NA_real_,
-        CI_Lower = NA_real_,
-        CI_Upper = NA_real_,
-        Samples_included = k,
-        Logit_Estimate = NA_real_,
-        τ2 = NA_real_,
-        check.names = FALSE
+      list(
+        summary = data.frame(
+          Analysis = label, Pooled_Prevalence = NA_real_, CrI_Lower = NA_real_,
+          CrI_Upper = NA_real_, Samples_included = sum(ok), Logit_Estimate = NA_real_,
+          Tau = NA_real_, Rhat_max = NA_real_, check.names = FALSE
+        ),
+        model = NULL
       )
     )
   }
 
-  # Subset to usable rows so xi/ni align with data
   df_use <- df[ok, , drop = FALSE]
-  xi <- xi[ok]
-  ni <- ni[ok]
+  df_use$n_events <- xi[ok]
+  df_use$n_total  <- ni[ok]
 
-  # Continuity correction for extreme proportions
-  extreme <- (xi == 0 | xi == ni)
-  xi[extreme] <- xi[extreme] + 0.5
-  ni[extreme] <- ni[extreme] + 1
+  priors <- c(
+    set_prior("normal(0, 1.5)", class = "Intercept"),
+    set_prior("student_t(3, 0, 1)", class = "sd")
+  )
 
-  fit <- metafor::rma.glmm(measure = "PLO", xi = xi, ni = ni, data = df_use)
-  pr  <- predict(fit, transf = metafor::transf.ilogit)
+  fit <- brm(
+    n_events | trials(n_total) ~ 1 + (1 | Study),
+    data    = df_use,
+    family  = binomial(link = "logit"),
+    prior   = priors,
+    chains  = chains,
+    iter    = iter,
+    warmup  = warmup,
+    seed    = seed,
+    refresh = refresh,
+    control = list(adapt_delta = adapt_delta)
+  )
 
-  data.frame(
+  draws      <- as_draws_df(fit)
+  post_int   <- draws$b_Intercept
+  prev_draws <- plogis(post_int)
+  tau_draws  <- draws$sd_Study__Intercept
+
+  summary_df <- data.frame(
     Analysis          = label,
-    Pooled_Prevalence = round(as.numeric(pr$pred), 3),
-    CI_Lower          = round(as.numeric(pr$ci.lb), 3),
-    CI_Upper          = round(as.numeric(pr$ci.ub), 3),
-    Samples_included  = fit$k,
-    Logit_Estimate    = round(unname(coef(fit)[1]), 3),
-    τ2                = round(as.numeric(fit$tau2), 3),
+    Pooled_Prevalence = round(mean(prev_draws), 3),
+    CrI_Lower         = round(as.numeric(quantile(prev_draws, .025)), 3),
+    CrI_Upper         = round(as.numeric(quantile(prev_draws, .975)), 3),
+    Samples_included  = k,
+    Logit_Estimate    = round(mean(post_int), 3),
+    Tau               = round(mean(tau_draws), 3),
+    Rhat_max          = round(max(brms::rhat(fit), na.rm = TRUE), 3),
     check.names = FALSE
   )
+  
+  return(list(summary = summary_df, model = fit))
 }
-
 ```
 
-## Decreasing Symptoms Trajectory
+## Conservative (Zero-Imputed) Estimate Helper
 
-We estimate the pooled prevalence of the Decreasing trajectory using a Generalized Linear Mixed Model (GLMM).
+The main analysis above only includes studies that identified a given trajectory as a distinct latent class. This means the pooled prevalence for less-commonly-detected trajectories (e.g. Decreasing, Partially Decreasing) is estimated only among the subset of studies capable of finding that pattern — which is not the same as the prevalence across the full body of evidence, and may overestimate the "true" prevalence.
+
+As a more conservative complement, we build a second dataset per trajectory in which **every study with a usable total sample size is retained**, and studies that did not identify the trajectory in question are coded as contributing **0 events** (rather than being dropped). Pooling across this dataset gives a lower-bound estimate; the main analysis serves as the corresponding upper-bound estimate.
+
+```{r conservative-helper}
+# Build a "conservative" (zero-imputed) version of a trajectory dataset.
+# Studies with a valid Sample_size but no identified trajectory (NA percentage)
+# are retained with n_events = 0, instead of being excluded.
+make_conservative_df <- function(df, event_col, percentage_col, n_col = "Sample_size") {
+  df_cons <- df
+  has_size <- !is.na(df_cons[[n_col]]) & df_cons[[n_col]] > 0
+  df_cons  <- df_cons[has_size, , drop = FALSE]
+
+  df_cons[[event_col]] <- ifelse(
+    is.na(df_cons[[percentage_col]]),
+    0,
+    df_cons[[event_col]]
+  )
+
+  df_cons
+}
+```
+
+---
+
+## Decreasing Symptoms Trajectory
 
 ### Descriptives
 
 ```{r Decreasing-descriptives}
-# Copy the dataset to avoid overwriting the original
 df_Decreasing <- df_moderation
-
-# Ensure Decreasing_percentage is numeric
 df_Decreasing$Decreasing_percentage <- as.numeric(df_Decreasing$Decreasing_percentage)
-
-
-# Calculate Decreasing_n as (percentage / 100) * sample size
 df_Decreasing$Decreasing_n <- round((df_Decreasing$Decreasing_percentage / 100) * df_Decreasing$Sample_size)
 
-# Total number of individuals classified as Decreasing (ignoring missingness in other variables)
 total_Decreasing_n <- sum(df_Decreasing$Decreasing_n, na.rm = TRUE)
-
-# Number of unique samples (assumes a column Study exists)
 unique_Decreasing_studies <- length(unique(df_Decreasing$Study[!is.na(df_Decreasing$Decreasing_percentage)]))
 
-# Display as a table
 additional_info <- data.frame(
   Description = c("Total number of individuals in Decreasing trajectory", "Number of unique studies"),
   Value = format(c(total_Decreasing_n, unique_Decreasing_studies), big.mark = ",")
 )
-
 knitr::kable(additional_info, caption = "Additional Descriptives for Decreasing Trajectory Analysis")
 ```
 
-### Generic GLMM
+### Main Analysis
 
-```{r Decreasing-glmm}
-# Fit GLMM
-glmm_Decreasing <- fit_glmm_prev(df_Decreasing, event_col = "Decreasing_n", n_col = "Sample_size",
-                             label = "Main Analysis")
-
-# Display result
-knitr::kable(glmm_Decreasing, caption = "Pooled Prevalence Estimate for Decreasing Trajectory (GLMM)")
+```{r Decreasing-main, results='hide'}
+res_Decreasing <- fit_bglmm_prev(df_Decreasing, event_col = "Decreasing_n", 
+                                 n_col = "Sample_size", label = "Main Analysis")
+bglmm_Decreasing <- res_Decreasing$summary
+```
+```{r Decreasing-main-table}
+knitr::kable(bglmm_Decreasing, caption = "Pooled Prevalence Estimate for Decreasing Trajectory")
 ```
 
-### Sensitivity Analysis 1
+### Sensitivity Analysis 1 (Exclude ≥90%)
 
-Exclude samples ≥90% Decreasing Proportions
+```{r Decreasing-sens1, results='hide'}
+df_Decreasing_sens1 <- subset(df_Decreasing, !is.na(Decreasing_n) & !is.na(Sample_size) &
+                              !is.na(Decreasing_percentage) & Decreasing_percentage < 90)
 
-```{r Decreasing-sens1}
-# Subset: Exclude samples with Decreasing trajectory ≥90% of the sample
-df_Decreasing_sens1 <- subset(df_Decreasing,
-                   !is.na(Decreasing_n) & !is.na(Sample_size) &
-                   !is.na(Decreasing_percentage) & Decreasing_percentage < 90)
-
-# Fit GLMM
-glmm_Decreasing_sens1 <-  fit_glmm_prev(df_Decreasing_sens1, "Decreasing_n", "Sample_size", "Sensitivity 1: Exclude ≥90% Decreasing")
-
-# Display table
-knitr::kable(glmm_Decreasing_sens1, caption = "Sensitivity Analysis 1: Decreasing Trajectory (Excl. ≥90% Prevalence)")
+bglmm_Decreasing_sens1 <- fit_bglmm_prev(df_Decreasing_sens1, "Decreasing_n", "Sample_size", 
+                                         "Sensitivity 1: Exclude ≥90% Decreasing", min_k = 5)$summary
+```
+```{r Decreasing-sens1-table}
+knitr::kable(bglmm_Decreasing_sens1, caption = "Sensitivity 1: Excl. ≥90% Prevalence")
 ```
 
-### Sensitivity Analysis 2
+### Sensitivity Analysis 2 (Large Samples, N > 999)
 
-Include Only Samples with N \> 999
+```{r Decreasing-sens2, results='hide'}
+df_Decreasing_sens2 <- subset(df_Decreasing, !is.na(Decreasing_n) & !is.na(Sample_size) &
+                              Sample_size > 999)
 
-```{r Decreasing-sens2}
-# Subset: Include only samples with Sample_size > 999
-df_Decreasing_sens2 <- subset(df_Decreasing,
-                   !is.na(Decreasing_n) & !is.na(Sample_size) &
-                   Sample_size > 999)
-
-# Fit GLMM
-glmm_Decreasing_sens2 <- fit_glmm_prev(df_Decreasing_sens2, "Decreasing_n", "Sample_size", "Sensitivity 2: N > 999")
-
-# Display table
-knitr::kable(glmm_Decreasing_sens2, caption = "Sensitivity Analysis 2: Decreasing Trajectory (Samples > 999)")
+bglmm_Decreasing_sens2 <- fit_bglmm_prev(df_Decreasing_sens2, "Decreasing_n", "Sample_size", 
+                                         "Sensitivity 2: N > 999", min_k = 5)$summary
+```
+```{r Decreasing-sens2-table}
+knitr::kable(bglmm_Decreasing_sens2, caption = "Sensitivity 2: Samples > 999")
 ```
 
-### Sensitivity Analysis 3
+### Sensitivity Analysis 3 (Exclude Influential Studies via Pareto *k*)
 
-Exclude Influential Studies
+We use Bayesian Leave-One-Out (LOO) cross-validation to identify highly influential studies. Studies with a Pareto *k* shape parameter > 0.7 are considered highly influential and are excluded in this sensitivity step.
 
-```{r Decreasing-influential}
-# Fit a GLMM with glmer (binomial model with random study effect)
-model_glmer_Decreasing <- glmer(cbind(round(Decreasing_n), Sample_size - round(Decreasing_n)) ~ 1 + (1 | Study),
-                     data = df_Decreasing,
-                     family = binomial)
+```{r Decreasing-influential, results='hide'}
+# Run LOO on the main model fit
+loo_Decreasing <- brms::loo(res_Decreasing$model)
+pareto_k_Decreasing <- loo_Decreasing$diagnostics$pareto_k
 
-# Run influence analysis by Studies
-infl <- influence(model_glmer_Decreasing, group = "Study")
+# Identify studies with pareto k > 0.7
+influential_indices <- which(pareto_k_Decreasing > 0.7)
+influential_studies_Decreasing <- unique(res_Decreasing$model$data$Study[influential_indices])
 
-# Compute Cook's distance
-cooks <- cooks.distance(infl)
-
-# Define rule-of-thumb threshold
-threshold <- 4 / length(cooks)
-
-# Plot Cook's distances
-p1 <- plot(cooks, type = "h", lwd = 2,
-     main = "Cook's Distance per Study",
-     ylab = "Cook's Distance", xlab = "Study Index")
-abline(h = threshold, col = "red", lty = 2)
-
-# Identify studies above the threshold
-influential_indices <- which(cooks > threshold)
-influential_studies_Decreasing <- unique(df_Decreasing$Study[influential_indices])
-
-# Display studies
-influential_table <- data.frame(
-  Study_ID = influential_studies_Decreasing,
-  Cooks_Distance = round(cooks[influential_indices], 3)
-)
-
-knitr::kable(influential_table, caption = "Studies Identified as Influential (Cook's Distance)")
-```
-
-Exclude Influential Studies
-
-```{r Decreasing-sens-infl}
-# Exclude the influential studies
+# Exclude and refit
 df_Decreasing_noinf <- df_Decreasing %>%
   filter(!Study %in% influential_studies_Decreasing)
 
-# Refit GLMM
-glmm_Decreasing_noinf <- fit_glmm_prev(df_Decreasing_noinf, "Decreasing_n", "Sample_size",
-                           "Sensitivity 3: Excluding Influential Studies")
-
-# Display table
-knitr::kable(glmm_Decreasing_noinf, caption = "Sensitivity Analysis 3: Decreasing Trajectory (Excluding Influential Studies)")
+bglmm_Decreasing_noinf <- fit_bglmm_prev(df_Decreasing_noinf, "Decreasing_n", "Sample_size",
+                           "Sensitivity 3: Excluding Influential Studies", min_k = 5)$summary
+```
+```{r Decreasing-influential-table}
+knitr::kable(data.frame(Study = influential_studies_Decreasing), caption = "Influential Studies Excluded (Pareto k > 0.7)")
+knitr::kable(bglmm_Decreasing_noinf, caption = "Sensitivity 3: Excl. Influential Studies")
 ```
 
-### Use `glmer` estimate
+### Sensitivity Analysis 4 (Conservative: Zero-Imputed Lower Bound)
 
-Use with the glmer\`-based intercept estimate:
+```{r Decreasing-conservative, results='hide'}
+df_Decreasing_cons <- make_conservative_df(df_Decreasing, "Decreasing_n", "Decreasing_percentage")
 
-```{r Decreasing-glmer-summary}
-# Extract fixed effect estimate
-est_glmer_Decreasing <- fixef(model_glmer_Decreasing)["(Intercept)"]
-se_glmer_Decreasing <- sqrt(vcov(model_glmer_Decreasing)["(Intercept)", "(Intercept)"])
-
-# Compute 95% CI (logit scale)
-ci_Partially_Decreasinger_glmer_Decreasing <- est_glmer_Decreasing - 1.96 * se_glmer_Decreasing
-ci_upper_glmer_Decreasing <- est_glmer_Decreasing + 1.96 * se_glmer_Decreasing
-
-n_glmer_studies_Decreasing <- length(ranef(model_glmer_Decreasing)$Study[[1]])
-
-# Run glmer
-glmer_summary_Decreasing <- data.frame(
-  Model = "glmer (binomial, random intercept)",
-  Pooled_Prevalence = round(plogis(est_glmer_Decreasing), 3),
-  ci_Partially_Decreasinger = round(plogis(ci_Partially_Decreasinger_glmer_Decreasing), 3),
-  CI_Upper = round(plogis(ci_upper_glmer_Decreasing), 3), 
-  Studies_included = n_glmer_studies_Decreasing
-)
-
-knitr::kable(glmer_summary_Decreasing, caption = "Decreasing Trajectory Estimate from glmer Model")
+bglmm_Decreasing_cons <- fit_bglmm_prev(df_Decreasing_cons, "Decreasing_n", "Sample_size",
+                           "Sensitivity 4: Conservative (Zero-Imputed)", min_k = 5)$summary
 ```
+```{r Decreasing-conservative-table}
+knitr::kable(bglmm_Decreasing_cons, caption = "Sensitivity 4: Conservative Lower-Bound Estimate (Zero-Imputed)")
+```
+
+---
 
 ## Partially Decreasing Symptom Trajectory
 
 ### Descriptives
 
-We provide additional descriptives based on the Partially_Decreasing trajectory variable, using the full dataset.
-
 ```{r Partially_Decreasing-descriptives}
-# Copy the dataset to avoid overwriting the original
 df_Partially_Decreasing <- df_moderation
-
-# Ensure Partially_Decreasing_percentage is numeric
 df_Partially_Decreasing$Partially_Decreasing_percentage <- as.numeric(df_Partially_Decreasing$Partially_Decreasing_percentage)
-
-# Calculate Partially_Decreasing_n as (percentage / 100) * sample size
 df_Partially_Decreasing$Partially_Decreasing_n <- round((df_Partially_Decreasing$Partially_Decreasing_percentage / 100) * df_Partially_Decreasing$Sample_size)
 
-# Total number of individuals classified as Partially_Decreasing (ignoring missingness in other variables)
 total_Partially_Decreasing_n <- sum(df_Partially_Decreasing$Partially_Decreasing_n, na.rm = TRUE)
-
-# Number of unique samples (assumes a column Study exists)
 unique_Partially_Decreasing_studies <- length(unique(df_Partially_Decreasing$Study[!is.na(df_Partially_Decreasing$Partially_Decreasing_percentage)]))
 
-# Display as a table
 additional_info <- data.frame(
-  Description = c("Total number of individuals in Partially_Decreasing trajectory", "Number of unique studies"),
+  Description = c("Total number of individuals in Partially Decreasing trajectory", "Number of unique studies"),
   Value = format(c(total_Partially_Decreasing_n, unique_Partially_Decreasing_studies), big.mark = ",")
 )
-
-knitr::kable(additional_info, caption = "Additional Descriptives for Partially_Decreasing Trajectory Analysis")
+knitr::kable(additional_info, caption = "Additional Descriptives for Partially Decreasing Trajectory Analysis")
 ```
 
-### Generic GLMM results
+### Main Analysis
 
-We estimate the pooled prevalence of the **Partially_Decreasing trajectory** using a Generalized Linear Mixed Model (GLMM).\
-We apply a continuity correction of 0.5 individuals for studies reporting exactly 0% or 100% Partially_Decreasing cases.\
-No data is removed from the dataset; the `rma.glmm()` function handles missingness internally.
-
-```{r Partially_Decreasing-glmm}
-# Fit GLMM
-glmm_Partially_Decreasing <- fit_glmm_prev(df_Partially_Decreasing, event_col = "Partially_Decreasing_n", n_col = "Sample_size",
-                             label = "Main Analysis")
-
-# Display result
-knitr::kable(glmm_Partially_Decreasing, caption = "Pooled Prevalence Estimate for Partially_Decreasing Trajectory (GLMM)")
+```{r Partially_Decreasing-main, results='hide'}
+res_Partially_Decreasing <- fit_bglmm_prev(df_Partially_Decreasing, event_col = "Partially_Decreasing_n", 
+                                           n_col = "Sample_size", label = "Main Analysis")
+bglmm_Partially_Decreasing <- res_Partially_Decreasing$summary
+```
+```{r Partially_Decreasing-main-table}
+knitr::kable(bglmm_Partially_Decreasing, caption = "Pooled Prevalence Estimate for Partially Decreasing Trajectory")
 ```
 
-### Sensitivity Analysis 1
+### Sensitivity Analysis 1 (Exclude ≥90%)
 
-Excluding samples with Partially_Decreasing trajectory ≥90% of the sample
+```{r Partially_Decreasing-sens1, results='hide'}
+df_Partially_Decreasing_sens1 <- subset(df_Partially_Decreasing, !is.na(Partially_Decreasing_n) & !is.na(Sample_size) &
+                              !is.na(Partially_Decreasing_percentage) & Partially_Decreasing_percentage < 90)
 
-```{r Partially_Decreasing-sensitivity_1}
-# Subset: Exclude samples with Partially_Decreasing trajectory ≥90% of the sample
-df_Partially_Decreasing_sens1 <- subset(df_Partially_Decreasing,
-                   !is.na(Partially_Decreasing_n) & !is.na(Sample_size) &
-                   !is.na(Partially_Decreasing_percentage) & Partially_Decreasing_percentage < 90)
-
-# Fit GLMM
-glmm_Partially_Decreasing_sens1 <-  fit_glmm_prev(df_Partially_Decreasing_sens1, "Partially_Decreasing_n", "Sample_size", "Sensitivity 1: Exclude ≥90% Partially_Decreasing")
-
-# Display table
-knitr::kable(glmm_Partially_Decreasing_sens1, caption = "Sensitivity Analysis 1: Partially_Decreasing Trajectory (Excl. ≥90% Prevalence)")
+bglmm_Partially_Decreasing_sens1 <- fit_bglmm_prev(df_Partially_Decreasing_sens1, "Partially_Decreasing_n", "Sample_size", 
+                                         "Sensitivity 1: Exclude ≥90% Partially Decreasing", min_k = 5)$summary
+```
+```{r Partially_Decreasing-sens1-table}
+knitr::kable(bglmm_Partially_Decreasing_sens1, caption = "Sensitivity 1: Excl. ≥90% Prevalence")
 ```
 
-### Sensitivity Analysis 2
+### Sensitivity Analysis 2 (Large Samples, N > 999)
 
-Including only large samples (N \> 999)
+```{r Partially_Decreasing-sens2, results='hide'}
+df_Partially_Decreasing_sens2 <- subset(df_Partially_Decreasing, !is.na(Partially_Decreasing_n) & !is.na(Sample_size) &
+                              Sample_size > 999)
 
-```{r Partially_Decreasing-sensitivity-2}
-# Subset: Include only samples with Sample_size > 999
-df_Partially_Decreasing_sens2 <- subset(df_Partially_Decreasing,
-                   !is.na(Partially_Decreasing_n) & !is.na(Sample_size) &
-                   Sample_size > 999)
-
-# Fit GLMM
-glmm_Partially_Decreasing_sens2 <- fit_glmm_prev(df_Partially_Decreasing_sens2, "Partially_Decreasing_n", "Sample_size", "Sensitivity 2: N > 999")
-
-# Display table
-knitr::kable(glmm_Partially_Decreasing_sens2, caption = "Sensitivity Analysis 2: Partially_Decreasing Trajectory (Samples > 999)")
+bglmm_Partially_Decreasing_sens2 <- fit_bglmm_prev(df_Partially_Decreasing_sens2, "Partially_Decreasing_n", "Sample_size", 
+                                         "Sensitivity 2: N > 999", min_k = 5)$summary
+```
+```{r Partially_Decreasing-sens2-table}
+knitr::kable(bglmm_Partially_Decreasing_sens2, caption = "Sensitivity 2: Samples > 999")
 ```
 
-### Sensitivity Analysis 3
+### Sensitivity Analysis 3 (Exclude Influential Studies via Pareto *k*)
 
-Exclude Influential Studies: We conducted an influence analysis to identify studies with disproportionate impact on the pooled estimate using Cook's distance from a glmer model.
+```{r Partially_Decreasing-influential, results='hide'}
+loo_Partially_Decreasing <- brms::loo(res_Partially_Decreasing$model)
+pareto_k_Partially <- loo_Partially_Decreasing$diagnostics$pareto_k
 
-```{r Partially_Decreasing-influential}
-# Fit a GLMM with glmer (binomial model with random study effect)
-model_glmer_Partially_Decreasing <- glmer(cbind(round(Partially_Decreasing_n), Sample_size - round(Partially_Decreasing_n)) ~ 1 + (1 | Study),
-                     data = df_Partially_Decreasing,
-                     family = binomial)
+influential_indices <- which(pareto_k_Partially > 0.7)
+influential_studies_Partially_Decreasing <- unique(res_Partially_Decreasing$model$data$Study[influential_indices])
 
-# Run influence analysis by Studies
-infl <- influence(model_glmer_Partially_Decreasing, group = "Study")
-
-# Compute Cook's distance
-cooks <- cooks.distance(infl)
-
-# Define rule-of-thumb threshold
-threshold <- 4 / length(cooks)
-
-# Plot Cook's distances
-p1 <- plot(cooks, type = "h", lwd = 2,
-     main = "Cook's Distance per Study",
-     ylab = "Cook's Distance", xlab = "Study Index")
-abline(h = threshold, col = "red", lty = 2)
-
-# Identify studies above the threshold
-influential_indices <- which(cooks > threshold)
-influential_studies_Partially_Decreasing <- unique(df_Partially_Decreasing$Study[influential_indices])
-
-# Display studies
-influential_table <- data.frame(
-  Study_ID = influential_studies_Partially_Decreasing,
-  Cooks_Distance = round(cooks[influential_indices], 3)
-)
-
-knitr::kable(influential_table, caption = "Studies Identified as Influential (Cook's Distance)")
-```
-
-We reran the GLMM excluding the identified influential studies.
-
-```{r Partially_Decreasing-sens-influential}
-# Exclude the influential studies
 df_Partially_Decreasing_noinf <- df_Partially_Decreasing %>%
   filter(!Study %in% influential_studies_Partially_Decreasing)
 
-# Refit GLMM (metafor version)
-glmm_Partially_Decreasing_noinf <- fit_glmm_prev(df_Partially_Decreasing_noinf, "Partially_Decreasing_n", "Sample_size",
-                           "Sensitivity 3: Excluding Influential Studies")
-
-# Display table
-knitr::kable(glmm_Partially_Decreasing_noinf, caption = "Sensitivity Analysis 3: Partially_Decreasing Trajectory (Excluding Influential Studies)")
+bglmm_Partially_Decreasing_noinf <- fit_bglmm_prev(df_Partially_Decreasing_noinf, "Partially_Decreasing_n", "Sample_size",
+                           "Sensitivity 3: Excluding Influential Studies", min_k = 5)$summary
+```
+```{r Partially_Decreasing-influential-table}
+knitr::kable(data.frame(Study = influential_studies_Partially_Decreasing), caption = "Influential Studies Excluded (Pareto k > 0.7)")
+knitr::kable(bglmm_Partially_Decreasing_noinf, caption = "Sensitivity 3: Excl. Influential Studies")
 ```
 
-### Use `glmer` estimate
+### Sensitivity Analysis 4 (Conservative: Zero-Imputed Lower Bound)
 
-with the glmer\`-based intercept estimate:
+```{r Partially_Decreasing-conservative, results='hide'}
+df_Partially_Decreasing_cons <- make_conservative_df(df_Partially_Decreasing, "Partially_Decreasing_n", "Partially_Decreasing_percentage")
 
-```{r Partially_Decreasing-glmer-summary}
-# Extract fixed effect estimate
-est_glmer_Partially_Decreasing <- fixef(model_glmer_Partially_Decreasing)["(Intercept)"]
-se_glmer_Partially_Decreasing <- sqrt(vcov(model_glmer_Partially_Decreasing)["(Intercept)", "(Intercept)"])
-
-# Compute 95% CI (logit scale)
-ci_Partially_Decreasinger_glmer_Partially_Decreasing <- est_glmer_Partially_Decreasing - 1.96 * se_glmer_Partially_Decreasing
-ci_upper_glmer_Partially_Decreasing <- est_glmer_Partially_Decreasing + 1.96 * se_glmer_Partially_Decreasing
-
-n_glmer_studies_Partially_Decreasing <- length(ranef(model_glmer_Partially_Decreasing)$Study[[1]])
-
-# Run glmer
-glmer_summary_Partially_Decreasing <- data.frame(
-  Model = "glmer (binomial, random intercept)",
-  Pooled_Prevalence = round(plogis(est_glmer_Partially_Decreasing), 3),
-  CI_Partially_Decreasinger = round(plogis(ci_Partially_Decreasinger_glmer_Partially_Decreasing), 3),
-  CI_Upper = round(plogis(ci_upper_glmer_Partially_Decreasing), 3), 
-  Studies_included = n_glmer_studies_Partially_Decreasing
-)
-
-knitr::kable(glmer_summary_Partially_Decreasing, caption = "Partially_Decreasing Trajectory Estimate from glmer Model")
+bglmm_Partially_Decreasing_cons <- fit_bglmm_prev(df_Partially_Decreasing_cons, "Partially_Decreasing_n", "Sample_size",
+                           "Sensitivity 4: Conservative (Zero-Imputed)", min_k = 5)$summary
+```
+```{r Partially_Decreasing-conservative-table}
+knitr::kable(bglmm_Partially_Decreasing_cons, caption = "Sensitivity 4: Conservative Lower-Bound Estimate (Zero-Imputed)")
 ```
 
-**Note on Number of Studies Included** The number of studies included in the models may differ between rma.glmm() and glmer(). This is expected because the two methods handle data slightly differently:
+---
 
-rma.glmm() is designed for meta-analysis and accepts aggregated data (events + sample size). It applies continuity corrections directly and may include more studies when appropriate.
-
-glmer() is a general GLMM function. It uses binomial counts and handles missingness or zero counts differently. Studies with no variance or missing outcomes may be excluded automatically.
-
-Both approaches are valid, but they may produce slightly different sample sizes. We report both transparently for completeness.
-
-## High Symptoms Trajectory
-
-We estimate the pooled prevalence of the High trajectory using a Generalized Linear Mixed Model (GLMM).
+## Persistent Symptoms Trajectory
 
 ### Descriptives
 
-```{r High-descriptives}
-# Copy the dataset to avoid overwriting the original
-df_High <- df_moderation
+```{r Persistent-descriptives}
+df_Persistent <- df_moderation
+df_Persistent$Persistent_percentage <- as.numeric(df_Persistent$Persistent_percentage)
+df_Persistent$Persistent_n <- round((df_Persistent$Persistent_percentage / 100) * df_Persistent$Sample_size)
 
-# Ensure High_percentage is numeric
-df_High$High_percentage <- as.numeric(df_High$High_percentage)
+total_Persistent_n <- sum(df_Persistent$Persistent_n, na.rm = TRUE)
+unique_Persistent_studies <- length(unique(df_Persistent$Study[!is.na(df_Persistent$Persistent_percentage)]))
 
-
-# Calculate High_n as (percentage / 100) * sample size
-df_High$High_n <- round((df_High$High_percentage / 100) * df_High$Sample_size)
-
-# Total number of individuals classified as High (ignoring missingness in other variables)
-total_High_n <- sum(df_High$High_n, na.rm = TRUE)
-
-# Number of unique samples (assumes a column Study exists)
-unique_High_studies <- length(unique(df_High$Study[!is.na(df_High$High_percentage)]))
-
-# Display as a table
 additional_info <- data.frame(
-  Description = c("Total number of individuals in High trajectory", "Number of unique studies"),
-  Value = format(c(total_High_n, unique_High_studies), big.mark = ",")
+  Description = c("Total number of individuals in Persistent trajectory", "Number of unique studies"),
+  Value = format(c(total_Persistent_n, unique_Persistent_studies), big.mark = ",")
 )
-
-knitr::kable(additional_info, caption = "Additional Descriptives for High Trajectory Analysis")
+knitr::kable(additional_info, caption = "Additional Descriptives for Persistent Trajectory Analysis")
 ```
 
-### Generic GLMM
+### Main Analysis
 
-```{r High-glmm}
-# Fit GLMM
-glmm_High <- fit_glmm_prev(df_High, event_col = "High_n", n_col = "Sample_size",
-                             label = "Main Analysis")
-
-# Display result
-knitr::kable(glmm_High, caption = "Pooled Prevalence Estimate for High Trajectory (GLMM)")
+```{r Persistent-main, results='hide'}
+res_Persistent <- fit_bglmm_prev(df_Persistent, event_col = "Persistent_n", 
+                                 n_col = "Sample_size", label = "Main Analysis")
+bglmm_Persistent <- res_Persistent$summary
+```
+```{r Persistent-main-table}
+knitr::kable(bglmm_Persistent, caption = "Pooled Prevalence Estimate for Persistent Trajectory")
 ```
 
-### Sensitivity Analysis 1
+### Sensitivity Analysis 1 (Exclude ≥90%)
 
-Exclude Samples with ≥90% Decreasing Proportions
+```{r Persistent-sens1, results='hide'}
+df_Persistent_sens1 <- subset(df_Persistent, !is.na(Persistent_n) & !is.na(Sample_size) &
+                              !is.na(Persistent_percentage) & Persistent_percentage < 90)
 
-```{r High-sens1}
-# Subset: Exclude samples with High trajectory ≥90% of the sample
-df_High_sens1 <- subset(df_High,
-                   !is.na(High_n) & !is.na(Sample_size) &
-                   !is.na(High_percentage) & High_percentage < 90)
-
-# Fit GLMM
-glmm_High_sens1 <-  fit_glmm_prev(df_High_sens1, "High_n", "Sample_size", "Sensitivity 1: Exclude ≥90% High")
-
-# Display table
-knitr::kable(glmm_High_sens1, caption = "Sensitivity Analysis 1: High Trajectory (Excl. ≥90% Prevalence)")
+bglmm_Persistent_sens1 <- fit_bglmm_prev(df_Persistent_sens1, "Persistent_n", "Sample_size", 
+                                         "Sensitivity 1: Exclude ≥90% Persistent", min_k = 5)$summary
+```
+```{r Persistent-sens1-table}
+knitr::kable(bglmm_Persistent_sens1, caption = "Sensitivity 1: Excl. ≥90% Prevalence")
 ```
 
-### Sensitivity Analysis 2
+### Sensitivity Analysis 2 (Large Samples, N > 999)
 
-Include Only Samples with N \> 999
+```{r Persistent-sens2, results='hide'}
+df_Persistent_sens2 <- subset(df_Persistent, !is.na(Persistent_n) & !is.na(Sample_size) &
+                              Sample_size > 999)
 
-```{r High-sens2}
-# Subset: Include only samples with Sample_size > 999
-df_High_sens2 <- subset(df_High,
-                   !is.na(High_n) & !is.na(Sample_size) &
-                   Sample_size > 999)
-
-# Fit GLMM
-glmm_High_sens2 <- fit_glmm_prev(df_High_sens2, "High_n", "Sample_size", "Sensitivity 2: N > 999")
-
-# Display table
-knitr::kable(glmm_High_sens2, caption = "Sensitivity Analysis 2: High Trajectory (Samples > 999)")
+bglmm_Persistent_sens2 <- fit_bglmm_prev(df_Persistent_sens2, "Persistent_n", "Sample_size", 
+                                         "Sensitivity 2: N > 999", min_k = 5)$summary
+```
+```{r Persistent-sens2-table}
+knitr::kable(bglmm_Persistent_sens2, caption = "Sensitivity 2: Samples > 999")
 ```
 
-### Sensitivity Analysis 3
+### Sensitivity Analysis 3 (Exclude Influential Studies via Pareto *k*)
 
-Exclude Influential Studies
+```{r Persistent-influential, results='hide'}
+loo_Persistent <- brms::loo(res_Persistent$model)
+pareto_k_Persistent <- loo_Persistent$diagnostics$pareto_k
 
-```{r High-influential}
-# Fit a GLMM with glmer (binomial model with random study effect)
-model_glmer_High <- glmer(cbind(round(High_n), Sample_size - round(High_n)) ~ 1 + (1 | Study),
-                     data = df_High,
-                     family = binomial)
+influential_indices <- which(pareto_k_Persistent > 0.7)
+influential_studies_Persistent <- unique(res_Persistent$model$data$Study[influential_indices])
 
-# Run influence analysis by Studies
-infl <- influence(model_glmer_High, group = "Study")
+df_Persistent_noinf <- df_Persistent %>%
+  filter(!Study %in% influential_studies_Persistent)
 
-# Compute Cook's distance
-cooks <- cooks.distance(infl)
-
-# Define rule-of-thumb threshold
-threshold <- 4 / length(cooks)
-
-# Plot Cook's distances
-p1 <- plot(cooks, type = "h", lwd = 2,
-     main = "Cook's Distance per Study",
-     ylab = "Cook's Distance", xlab = "Study Index")
-abline(h = threshold, col = "red", lty = 2)
-
-# Identify studies above the threshold
-influential_indices <- which(cooks > threshold)
-influential_studies_High <- unique(df_High$Study[influential_indices])
-
-# Display studies
-influential_table <- data.frame(
-  Study_ID = influential_studies_High,
-  Cooks_Distance = round(cooks[influential_indices], 3)
-)
-
-knitr::kable(influential_table, caption = "Studies Identified as Influential (Cook's Distance)")
+bglmm_Persistent_noinf <- fit_bglmm_prev(df_Persistent_noinf, "Persistent_n", "Sample_size",
+                           "Sensitivity 3: Excluding Influential Studies", min_k = 5)$summary
+```
+```{r Persistent-influential-table}
+knitr::kable(data.frame(Study = influential_studies_Persistent), caption = "Influential Studies Excluded (Pareto k > 0.7)")
+knitr::kable(bglmm_Persistent_noinf, caption = "Sensitivity 3: Excl. Influential Studies")
 ```
 
-Exclude Influential Studies
+### Sensitivity Analysis 4 (Conservative: Zero-Imputed Lower Bound)
 
-```{r High-sens-infl}
-# Exclude the influential studies
-df_High_noinf <- df_High %>%
-  filter(!Study %in% influential_studies_High)
+```{r Persistent-conservative, results='hide'}
+df_Persistent_cons <- make_conservative_df(df_Persistent, "Persistent_n", "Persistent_percentage")
 
-# Refit GLMM (metafor version)
-glmm_High_noinf <- fit_glmm_prev(df_High_noinf, "High_n", "Sample_size",
-                           "Sensitivity 3: Excluding Influential Studies")
-
-# Display table
-knitr::kable(glmm_High_noinf, caption = "Sensitivity Analysis 3: High Trajectory (Excluding Influential Studies)")
+bglmm_Persistent_cons <- fit_bglmm_prev(df_Persistent_cons, "Persistent_n", "Sample_size",
+                           "Sensitivity 4: Conservative (Zero-Imputed)", min_k = 5)$summary
+```
+```{r Persistent-conservative-table}
+knitr::kable(bglmm_Persistent_cons, caption = "Sensitivity 4: Conservative Lower-Bound Estimate (Zero-Imputed)")
 ```
 
-### Use `glmer`estimate
-
-Use with the glmer\`-based intercept estimate:
-
-```{r High-glmer-summary}
-# Extract fixed effect estimate
-est_glmer_High <- fixef(model_glmer_High)["(Intercept)"]
-se_glmer_High <- sqrt(vcov(model_glmer_High)["(Intercept)", "(Intercept)"])
-
-# Compute 95% CI (logit scale)
-ci_Partially_Decreasinger_glmer_High <- est_glmer_High - 1.96 * se_glmer_High
-ci_upper_glmer_High <- est_glmer_High + 1.96 * se_glmer_High
-
-n_glmer_studies_High <- length(ranef(model_glmer_High)$Study[[1]])
-
-# Run glmer
-glmer_summary_High <- data.frame(
-  Model = "glmer (binomial, random intercept)",
-  Pooled_Prevalence = round(plogis(est_glmer_High), 3),
-  ci_Partially_Decreasinger = round(plogis(ci_Partially_Decreasinger_glmer_High), 3),
-  CI_Upper = round(plogis(ci_upper_glmer_High), 3), 
-  Studies_included = n_glmer_studies_High
-)
-
-knitr::kable(glmer_summary_High, caption = "High Trajectory Estimate from glmer Model")
-```
+---
 
 ## Relapsing Symptoms Trajectory
-
-We estimate the pooled prevalence of the Relapsing trajectory using a Generalized Linear Mixed Model (GLMM)
 
 ### Descriptives
 
 ```{r Relapsing-descriptives}
-# Copy the dataset to avoid overwriting the original
 df_Relapsing <- df_moderation
-
-# Ensure Relapsing_percentage is numeric
 df_Relapsing$Relapsing_percentage <- as.numeric(df_Relapsing$Relapsing_percentage)
-
-
-# Calculate Relapsing_n as (percentage / 100) * sample size
 df_Relapsing$Relapsing_n <- round((df_Relapsing$Relapsing_percentage / 100) * df_Relapsing$Sample_size)
 
-# Total number of individuals classified as Relapsing (ignoring missingness in other variables)
 total_Relapsing_n <- sum(df_Relapsing$Relapsing_n, na.rm = TRUE)
-
-# Number of unique samples (assumes a column Study exists)
 unique_Relapsing_studies <- length(unique(df_Relapsing$Study[!is.na(df_Relapsing$Relapsing_percentage)]))
 
-# Display as a table
 additional_info <- data.frame(
   Description = c("Total number of individuals in Relapsing trajectory", "Number of unique studies"),
   Value = format(c(total_Relapsing_n, unique_Relapsing_studies), big.mark = ",")
 )
-
 knitr::kable(additional_info, caption = "Additional Descriptives for Relapsing Trajectory Analysis")
 ```
 
-### Generic GLMM
+### Main Analysis
 
-```{r Relapsing-glmm}
-# Fit GLMM
-glmm_Relapsing <- fit_glmm_prev(df_Relapsing, event_col = "Relapsing_n", n_col = "Sample_size",
-                             label = "Main Analysis")
-
-# Display result
-knitr::kable(glmm_Relapsing, caption = "Pooled Prevalence Estimate for Relapsing Trajectory (GLMM)")
+```{r Relapsing-main, results='hide'}
+res_Relapsing <- fit_bglmm_prev(df_Relapsing, event_col = "Relapsing_n", 
+                                n_col = "Sample_size", label = "Main Analysis")
+bglmm_Relapsing <- res_Relapsing$summary
+```
+```{r Relapsing-main-table}
+knitr::kable(bglmm_Relapsing, caption = "Pooled Prevalence Estimate for Relapsing Trajectory")
 ```
 
-### Sensitivity Analysis 1
+### Sensitivity Analysis 1 (Exclude ≥90%)
 
-Exclude Samples with ≥90% Prevalence
+```{r Relapsing-sens1, results='hide'}
+df_Relapsing_sens1 <- subset(df_Relapsing, !is.na(Relapsing_n) & !is.na(Sample_size) &
+                              !is.na(Relapsing_percentage) & Relapsing_percentage < 90)
 
-```{r Relapsing-sens1}
-# Subset: Exclude samples with Relapsing trajectory ≥90% of the sample
-df_Relapsing_sens1 <- subset(df_Relapsing,
-                   !is.na(Relapsing_n) & !is.na(Sample_size) &
-                   !is.na(Relapsing_percentage) & Relapsing_percentage < 90)
-
-# Fit GLMM
-glmm_Relapsing_sens1 <-  fit_glmm_prev(df_Relapsing_sens1, "Relapsing_n", "Sample_size", "Sensitivity 1: Exclude ≥90% Relapsing")
-
-# Display table
-knitr::kable(glmm_Relapsing_sens1, caption = "Sensitivity Analysis 1: Relapsing Trajectory (Excl. ≥90% Prevalence)")
+bglmm_Relapsing_sens1 <- fit_bglmm_prev(df_Relapsing_sens1, "Relapsing_n", "Sample_size", 
+                                         "Sensitivity 1: Exclude ≥90% Relapsing", min_k = 5)$summary
+```
+```{r Relapsing-sens1-table}
+knitr::kable(bglmm_Relapsing_sens1, caption = "Sensitivity 1: Excl. ≥90% Prevalence")
 ```
 
-### Sensitivity Analysis 2
+### Sensitivity Analysis 2 (Large Samples, N > 999)
 
-Only Large Samples (N \> 999)
+```{r Relapsing-sens2, results='hide'}
+df_Relapsing_sens2 <- subset(df_Relapsing, !is.na(Relapsing_n) & !is.na(Sample_size) &
+                              Sample_size > 999)
 
-```{r Relapsing-sens2}
-# Subset: Include only samples with Sample_size > 999
-df_Relapsing_sens2 <- subset(df_Relapsing,
-                   !is.na(Relapsing_n) & !is.na(Sample_size) &
-                   Sample_size > 999)
-
-# Fit GLMM
-glmm_Relapsing_sens2 <- fit_glmm_prev(df_Relapsing_sens2, "Relapsing_n", "Sample_size", "Sensitivity 2: N > 999")
-
-# Display table
-knitr::kable(glmm_Relapsing_sens2, caption = "Sensitivity Analysis 2: Relapsing Trajectory (Samples > 999)")
+bglmm_Relapsing_sens2 <- fit_bglmm_prev(df_Relapsing_sens2, "Relapsing_n", "Sample_size", 
+                                         "Sensitivity 2: N > 999", min_k = 5)$summary
+```
+```{r Relapsing-sens2-table}
+knitr::kable(bglmm_Relapsing_sens2, caption = "Sensitivity 2: Samples > 999")
 ```
 
-### Sensitivity Analysis 3
+### Sensitivity Analysis 3 (Exclude Influential Studies via Pareto *k*)
 
-Exclude Influential Studies
+```{r Relapsing-influential, results='hide'}
+loo_Relapsing <- brms::loo(res_Relapsing$model)
+pareto_k_Relapsing <- loo_Relapsing$diagnostics$pareto_k
 
-```{r Relapsing-influential}
-# Fit a GLMM with glmer (binomial model with random study effect)
-model_glmer_Relapsing <- glmer(cbind(round(Relapsing_n), Sample_size - round(Relapsing_n)) ~ 1 + (1 | Study),
-                     data = df_Relapsing,
-                     family = binomial)
+influential_indices <- which(pareto_k_Relapsing > 0.7)
+influential_studies_Relapsing <- unique(res_Relapsing$model$data$Study[influential_indices])
 
-# Run influence analysis by Studies
-infl <- influence(model_glmer_Relapsing, group = "Study")
-
-# Compute Cook's distance
-cooks <- cooks.distance(infl)
-
-# Define rule-of-thumb threshold
-threshold <- 4 / length(cooks)
-
-# Plot Cook's distances
-p1 <- plot(cooks, type = "h", lwd = 2,
-     main = "Cook's Distance per Study",
-     ylab = "Cook's Distance", xlab = "Study Index")
-abline(h = threshold, col = "red", lty = 2)
-
-# Identify studies above the threshold
-influential_indices <- which(cooks > threshold)
-influential_studies_Relapsing <- unique(df_Relapsing$Study[influential_indices])
-
-# Display studies
-influential_table <- data.frame(
-  Study_ID = influential_studies_Relapsing,
-  Cooks_Distance = round(cooks[influential_indices], 3)
-)
-
-knitr::kable(influential_table, caption = "Studies Identified as Influential (Cook's Distance)")
-```
-
-Refit Model Excluding Influential Studies
-
-```{r Relapsing-sens-infl}
-# Exclude the influential studies
 df_Relapsing_noinf <- df_Relapsing %>%
   filter(!Study %in% influential_studies_Relapsing)
 
-# Refit GLMM (metafor version)
-glmm_Relapsing_noinf <- fit_glmm_prev(df_Relapsing_noinf, "Relapsing_n", "Sample_size",
-                           "Sensitivity 3: Excluding Influential Studies")
-
-# Display table
-knitr::kable(glmm_Relapsing_noinf, caption = "Sensitivity Analysis 3: Relapsing Trajectory (Excluding Influential Studies)")
+bglmm_Relapsing_noinf <- fit_bglmm_prev(df_Relapsing_noinf, "Relapsing_n", "Sample_size",
+                           "Sensitivity 3: Excluding Influential Studies", min_k = 5)$summary
+```
+```{r Relapsing-influential-table}
+knitr::kable(data.frame(Study = influential_studies_Relapsing), caption = "Influential Studies Excluded (Pareto k > 0.7)")
+knitr::kable(bglmm_Relapsing_noinf, caption = "Sensitivity 3: Excl. Influential Studies")
 ```
 
-### Use `glmer`estimate
+### Sensitivity Analysis 4 (Conservative: Zero-Imputed Lower Bound)
 
-```{r Relapsing-glmer-summary}
-# Extract fixed effect estimate
-est_glmer_Relapsing <- fixef(model_glmer_Relapsing)["(Intercept)"]
-se_glmer_Relapsing <- sqrt(vcov(model_glmer_Relapsing)["(Intercept)", "(Intercept)"])
+```{r Relapsing-conservative, results='hide'}
+df_Relapsing_cons <- make_conservative_df(df_Relapsing, "Relapsing_n", "Relapsing_percentage")
 
-# Compute 95% CI (logit scale)
-ci_Partially_Decreasinger_glmer_Relapsing <- est_glmer_Relapsing - 1.96 * se_glmer_Relapsing
-ci_upper_glmer_Relapsing <- est_glmer_Relapsing + 1.96 * se_glmer_Relapsing
-
-n_glmer_studies_Relapsing <- length(ranef(model_glmer_Relapsing)$Study[[1]])
-
-# Run glmer
-glmer_summary_Relapsing <- data.frame(
-  Model = "glmer (binomial, random intercept)",
-  Pooled_Prevalence = round(plogis(est_glmer_Relapsing), 3),
-  ci_Partially_Decreasinger = round(plogis(ci_Partially_Decreasinger_glmer_Relapsing), 3),
-  CI_Upper = round(plogis(ci_upper_glmer_Relapsing), 3), 
-  Studies_included = n_glmer_studies_Relapsing
-)
-
-knitr::kable(glmer_summary_Relapsing, caption = "Relapsing Trajectory Estimate from glmer Model")
+bglmm_Relapsing_cons <- fit_bglmm_prev(df_Relapsing_cons, "Relapsing_n", "Sample_size",
+                           "Sensitivity 4: Conservative (Zero-Imputed)", min_k = 5)$summary
 ```
+```{r Relapsing-conservative-table}
+knitr::kable(bglmm_Relapsing_cons, caption = "Sensitivity 4: Conservative Lower-Bound Estimate (Zero-Imputed)")
+```
+
+---
 
 # Tables for Paper
 
 ## Prevalences Summary Table
 
+We now present the pooled prevalence per trajectory alongside its conservative (zero-imputed) counterpart, giving an upper- and lower-bound estimate for each trajectory.
+
 ```{r prevalences-summary-table, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
-# Trajectory specification
-traj_specs <- tibble::tribble(
-  ~trajectory,  ~perc_col,                        ~event_col,
-  "Decreasing", "Decreasing_percentage",          "Decreasing_n",
-  "Partially_Decreasing", "Partially_Decreasing_percentage", "Partially_Decreasing_n",
-  "High",       "High_percentage",                "High_n",
-  "Relapsing",  "Relapsing_percentage",            "Relapsing_n"
-) %>%
-  mutate(trajectory = gsub("_", " ", trajectory))
+# Combine already computed Bayesian main results to save time
+fits_df <- bind_rows(
+  bglmm_Decreasing |> mutate(trajectory = "Decreasing symptoms"),
+  bglmm_Partially_Decreasing |> mutate(trajectory = "Partially decreasing symptoms"),
+  bglmm_Persistent |> mutate(trajectory = "Persistent symptoms"),
+  bglmm_Relapsing |> mutate(trajectory = "Relapsing symptoms")
+)
 
-
-# build a per-trajectory analysis frame & run GLMM
-build_and_fit <- function(df, perc_col, event_col, label = perc_col) {
-  df <- df %>% mutate(
-    !!perc_col := as.numeric(.data[[perc_col]]),
-    !!event_col := round((.data[[perc_col]] / 100) * .data[["Sample_size"]])
+# Conservative (zero-imputed) lower-bound estimates
+fits_cons_df <- bind_rows(
+  bglmm_Decreasing_cons |> mutate(trajectory = "Decreasing symptoms"),
+  bglmm_Partially_Decreasing_cons |> mutate(trajectory = "Partially decreasing symptoms"),
+  bglmm_Persistent_cons |> mutate(trajectory = "Persistent symptoms"),
+  bglmm_Relapsing_cons |> mutate(trajectory = "Relapsing symptoms")
+) |>
+  transmute(
+    trajectory,
+    cons_prev = sprintf("%.1f%%", 100 * Pooled_Prevalence),
+    cons_cri  = sprintf("%.1f to %.1f%%", 100 * CrI_Lower, 100 * CrI_Upper)
   )
 
-  # Counts for N and k
-  total_n <- sum(df[[event_col]], na.rm = TRUE)
-  k_unique <- length(unique(df$Study[!is.na(df[[perc_col]])]))
-
-  # Run your portable GLMM (uses your new function)
-  fit_row <- fit_glmm_prev(df, event_col = event_col, n_col = "Sample_size", label = label)
-
-  list(
-    df = df,
-    total_n = total_n,
-    k = k_unique,
-    fit = fit_row
-  )
+# Extract totals dynamically based on the dataset logic for N(%)
+calc_n <- function(df, perc_col) {
+  event_col <- round((as.numeric(df[[perc_col]]) / 100) * df[["Sample_size"]])
+  sum(event_col, na.rm = TRUE)
 }
 
-# analyses for all trajectories 
-analyses <- traj_specs %>%
-  rowwise() %>%
-  mutate(res = list(build_and_fit(df_moderation, perc_col, event_col, trajectory))) %>%
-  ungroup()
-
-# totals for N (%) 
-totals <- analyses %>%
-  mutate(N = purrr::map_dbl(res, "total_n")) %>%     # <-- ensure a numeric vector
-  transmute(
-    trajectory = factor(trajectory, levels = traj_specs$trajectory),
-    N
-  ) %>%
+totals <- tibble(
+  trajectory = c("Decreasing symptoms", "Partially decreasing symptoms", "Persistent symptoms", "Relapsing symptoms"),
+  N = c(
+    calc_n(df_moderation, "Decreasing_percentage"),
+    calc_n(df_moderation, "Partially_Decreasing_percentage"),
+    calc_n(df_moderation, "Persistent_percentage"),
+    calc_n(df_moderation, "Relapsing_percentage")
+  )
+) %>%
   mutate(pct = round(100 * N / sum(N, na.rm = TRUE), 1))
 
-# Extract model rows & assemble final table data
-fits_df <- analyses %>%
-  mutate(
-    k   = purrr::map_int(res, "k"),             
-    fit = purrr::map(res, "fit")
-  ) %>%
-  select(trajectory, k, fit) %>%
-  tidyr::unnest_wider(fit) %>%
-  transmute(
-    trajectory,
-    rel_prev = sprintf("%.1f%%", 100 * Pooled_Prevalence),
-    ci_95    = sprintf("%.1f to %.1f%%", 100 * CI_Lower, 100 * CI_Upper),
-    k        = as.integer(k),
-    logit    = round(Logit_Estimate, 2),
-    tau2     = round(`τ2`, 2)
-  )
-
-
-# Join counts and format N (%)
+# Format the final table frame
 table1_df <- fits_df %>%
   left_join(totals, by = "trajectory") %>%
+  left_join(fits_cons_df, by = "trajectory") %>%
   transmute(
     trajectory,
-    rel_prev,
-    ci_95,
-    k,
+    k = as.integer(Samples_included),
     N_pct = sprintf("%s (%.1f%%)", format(N, big.mark = ","), pct),
-    logit,
-    tau2
-  ) %>%
-  arrange(factor(trajectory, levels = traj_specs$trajectory))
+    bayes_prev = sprintf("%.1f%%", 100 * Pooled_Prevalence),
+    bayes_cri  = sprintf("%.1f to %.1f%%", 100 * CrI_Lower, 100 * CrI_Upper),
+    cons_prev,
+    cons_cri,
+    logit = round(Logit_Estimate, 2),
+    Tau = round(Tau, 2),
+    Rhat_max = round(Rhat_max, 3)
+  ) 
 
 # Render with gt
 tbl1 <- table1_df |>
   gt() |>
   cols_label(
     trajectory = "PTSD Symptom Trajectory",
-    rel_prev   = "Relative Prevalence",
-    ci_95      = "95% (CI)",
     k          = html("<em>k</em>"),
     N_pct      = "N (%)",
+    bayes_prev = "Relative Prevalence (Upper Bound)",
+    bayes_cri  = "95% CrI",
+    cons_prev  = "Conservative Prevalence (Lower Bound)",
+    cons_cri   = "95% CrI",
     logit      = "Logit Estimate",
-    tau2       = html("<em>&tau;<sup>2</sup></em>")
+    Tau        = html("<em>&tau;</em>"),
+    Rhat_max   = "Max R-hat"
   ) |>
   cols_align("left",   columns = trajectory) |>
-  cols_align("center", columns = c(rel_prev, ci_95, k, N_pct, logit, tau2)) |>
+  cols_align("center", columns = c(k, N_pct, bayes_prev, bayes_cri, cons_prev, cons_cri, logit, Tau, Rhat_max)) |>
   fmt_integer(columns = k, use_seps = TRUE) |>
-  fmt_number(columns = c(logit, tau2), decimals = 2) |>
+  fmt_number(columns = c(logit, Tau), decimals = 2) |>
+  fmt_number(columns = Rhat_max, decimals = 3) |>
   opt_row_striping() |>
   tab_style(
     style = cell_text(size = px(11), font = "Times New Roman"),
     locations = cells_source_notes()
   ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
   tab_options(
     table.width = pct(100),
     data_row.padding = px(6),
     table.font.size = px(13),
-    table.font.names = "Times New Roman",
-    column_labels.font.weight = "bold"
+    table.font.names = "Times New Roman"
   ) |>
   tab_source_note(
-    source_note = html("<em>Note.</em> <em>k</em> represents the number of unique samples. Logit estimate reflects pooled prevalence on a log-odds scale. <em>&tau;<sup>2</sup></em> indicates between-study heterogeneity; values &gt; 0.50 suggest substantial heterogeneity.")
-  ) |>
-  tab_style(
-    style = cell_text(size = px(11)),
-    locations = cells_source_notes()
+    source_note = html("<em>Note.</em> <em>k</em> represents the number of unique samples. Relative Prevalence (Upper Bound) reflects the posterior mean prevalence, logit estimate, and 95% credible interval (CrI) from a Bayesian random-intercept binomial GLMM (brms) with weakly informative priors (Intercept ~ Normal(0, 1.5); study SD ~ Student-t(3, 0, 1)), fit only to studies that identified the given trajectory. Conservative Prevalence (Lower Bound) fits the same model to all studies with a usable sample size, coding studies that did not identify the trajectory as contributing zero events. <em>&tau;</em> represents the between-study standard deviation. Max R-hat evaluates MCMC convergence, where values &le; 1.01 indicate good chain mixing and reliable posterior estimates.")
   ) |>
   opt_table_font(
     font = list(
@@ -968,10 +726,8 @@ tbl1 <- table1_df |>
 
 tbl1
 
-
 # Optional exports
 export_dir <- "Prevalences Tables"
-
 if (!dir.exists(export_dir)) {
   dir.create(export_dir, recursive = TRUE)
 }
@@ -983,48 +739,45 @@ gt::gtsave(tbl1, file.path(export_dir,"prevalences-summary-table.rtf"))
 ## Sensitivity Analyses Summary
 
 ```{r sensitivity-summary-table, message=FALSE, warning=FALSE}
-mk_row_df <- function(res_df, label) {
-  # res_df is the one-row data.frame returned by fit_glmm_prev()
-  r <- res_df[1, , drop = FALSE]
-  tibble(
-    Analysis = label,
-    k        = as.integer(r$Samples_included),
-    `Relative Prevalence (95% CI)` =
-      sprintf("%.1f%% [%.1f%% – %.1f%%]",
-              100 * as.numeric(r$Pooled_Prevalence),
-              100 * as.numeric(r$CI_Lower),
-              100 * as.numeric(r$CI_Upper)),
-    `Logit Estimate` = as.numeric(r$Logit_Estimate),
-    tau2             = suppressWarnings(as.numeric(r$`τ2`))
-  )
+mk_row_df <- function(r, label) {
+    tibble(
+      Analysis = label,
+      k        = as.integer(r$Samples_included),
+      `Relative Prevalence (95% CrI)` = 
+        sprintf("%.1f%% [%.1f%% – %.1f%%]",
+                100 * as.numeric(r$Pooled_Prevalence),
+                100 * as.numeric(r$CrI_Lower),
+                100 * as.numeric(r$CrI_Upper)),
+      `Logit Estimate` = as.numeric(r$Logit_Estimate),
+      Tau              = as.numeric(r$Tau)
+    )
 }
 
 # Labels / mappings
 trajectory_map <- c(
-  "Partially_Decreasing"        = "Partially decreasing symptoms",
-  "Decreasing" = "Decreasing symptoms",
-  "Increasing" = "Increasing symptoms",
-  "High"       = "High symptoms",
-  "Relapsing"   = "Relapsing symptoms"
+  "Decreasing"           = "Decreasing symptoms",
+  "Partially_Decreasing" = "Partially decreasing symptoms",
+  "Persistent"           = "Persistent symptoms",
+  "Relapsing"            = "Relapsing symptoms"
 )
 
 analysis_map <- c(
   "Main"  = "Main analysis (all studies)",
   "sens1" = "Excluding studies with extreme prevalence (≥90%)",
   "sens2" = "Including only large-sample studies (N ≥ 1000)",
-  "noinf" = "Excluding influential studies"
+  "noinf" = "Excluding influential studies (Pareto k > 0.7)",
+  "cons"  = "Conservative estimate (zero-imputed for non-identifying studies)"
 )
 
-# Build the spec of objects to look up (glmm_<traj>[_<stub>])
+# Build the spec of objects to look up
 all_specs <- tidyr::crossing(
   trajectory_stub = names(trajectory_map),
   analysis_stub   = names(analysis_map)
 ) |>
   mutate(
-    object_name = if_else(
-      analysis_stub == "Main",
-      paste0("glmm_", trajectory_stub),
-      paste0("glmm_", trajectory_stub, "_", analysis_stub)
+    object_name = dplyr::case_when(
+      analysis_stub == "Main"  ~ paste0("bglmm_", trajectory_stub),
+      TRUE                     ~ paste0("bglmm_", trajectory_stub, "_", analysis_stub)
     ),
     Trajectory = trajectory_map[trajectory_stub],
     Analysis   = analysis_map[analysis_stub]
@@ -1045,16 +798,17 @@ big_tbl <- purrr::pmap_dfr(
 trajectory_order <- c(
   "Decreasing symptoms",
   "Partially decreasing symptoms",
-  "High symptoms",
+  "Persistent symptoms",
   "Relapsing symptoms"
 )
 
 big_tbl_ordered <- big_tbl |>
+  filter(!is.na(k) & k > 5) |>
   mutate(Trajectory = factor(Trajectory, levels = trajectory_order)) |>
   arrange(Trajectory)
 
 # Create gt table
-gt_all <-
+gt_all <- 
   gt(big_tbl_ordered, groupname_col = "Trajectory") |>
   tab_style(
     style = cell_text(weight = "bold"),
@@ -1063,13 +817,13 @@ gt_all <-
   cols_label(
     Analysis = "Analysis",
     k = html("<em>k</em>"),
-    `Relative Prevalence (95% CI)` = "Relative Prevalence (95% CI)",
+    `Relative Prevalence (95% CrI)` = "Relative Prevalence (95% CrI)",
     `Logit Estimate` = "Logit Estimate",
-    tau2 = html("<em>&tau;<sup>2</sup></em>")
+    Tau = html("<em>&tau;</em>")
   ) |>
-  fmt_number(columns = c(`Logit Estimate`, tau2), decimals = 2) |>
+  fmt_number(columns = c(`Logit Estimate`, Tau), decimals = 2) |>
   cols_align(align = "left", columns = Analysis) |>
-  cols_align(align = "center", columns = c(k, `Relative Prevalence (95% CI)`, `Logit Estimate`, tau2)) |>
+  cols_align(align = "center", columns = c(k, `Relative Prevalence (95% CrI)`, `Logit Estimate`, Tau)) |>
   opt_row_striping() |>
   tab_options(
     table.font.names = c("Times New Roman", "Times", "serif"),
@@ -1083,7 +837,7 @@ gt_all <-
     locations = list(cells_source_notes(), cells_footnotes())
   ) |>
   tab_source_note(md(
-    "<em>Note.</em> <em>k</em> represents the number of unique samples. Logit estimate reflects pooled prevalence on a log-odds scale. <em>&tau;<sup>2</sup></em> indicates between-study heterogeneity; values &gt; 0.50 suggest substantial heterogeneity."
+    "<em>Note.</em> <em>k</em> represents the number of unique samples. Logit estimate reflects pooled prevalence on a log-odds scale. <em>&tau;</em> indicates between-study standard deviation. All estimates rely on Bayesian GLMMs (brms) with weakly informative priors. The conservative (zero-imputed) analysis codes studies that did not identify a given trajectory as contributing zero events, rather than excluding them, and can be read as a lower-bound estimate against the main analysis' upper bound. Analyses based on 5 or fewer studies (<em>k</em> &le; 5) are omitted from this table, as random-effects estimates become unstable with very few clusters."
   ))
 
 # Footnotes for excluded influential studies 
@@ -1113,7 +867,7 @@ gt_all <- purrr::reduce(
       footnote  = excluded_notes[[grp_label]],
       locations = cells_body(
         columns = "Analysis",
-        rows = (Trajectory == grp_label) & (Analysis == "Excluding influential studies")
+        rows = (Trajectory == grp_label) & (Analysis == "Excluding influential studies (Pareto k > 0.7)")
       )
     )
   }
@@ -1123,6 +877,5 @@ gt_all
 
 # Exports
 gt::gtsave(gt_all, file.path(export_dir, "prevalences-sensitivity-table.rtf"))
-
 gt::gtsave(gt_all, file.path(export_dir,"prevalences-sensitivity-table.png"), vwidth = 700) 
 ```
