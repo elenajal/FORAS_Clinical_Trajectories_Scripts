@@ -30,4 +30,4 @@ To run the scripts in this repository, you must first download the raw data file
 The research is supported by the Dutch Research Council under grant number 406.22.GO.048
 
 # Contact
-For questions contact Rens van de Schoot (a.g.j.vandeschoot@uu.nl) 
+For questions contact Elena Jalsovec (e.s.jalsovec@uu.nl) 
